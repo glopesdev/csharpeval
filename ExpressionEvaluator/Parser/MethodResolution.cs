@@ -30,6 +30,535 @@ namespace ExpressionEvaluator.Parser
 
     internal class MethodResolution
     {
+        #region Type Inference
+
+        static Type[] GetMethodTypeArguments(MethodInfo methodInfo, params Type[] arguments)
+        {
+            if (methodInfo == null)
+            {
+                throw new ArgumentNullException("methodInfo");
+            }
+
+            if (arguments == null)
+            {
+                throw new ArgumentNullException("arguments");
+            }
+
+            var parameters = methodInfo.GetParameters();
+            var genericArguments = methodInfo.GetGenericArguments();
+
+            // The binding candidates are the distinct results from matching parameters with arguments
+            // Matches for the same generic parameter position should be identical
+            var bindingCandidates = (from bindings in parameters.Zip(arguments, (parameter, argument) => GetParameterBindings(parameter.ParameterType, argument))
+                                     from binding in bindings
+                                     group binding by binding.Item2 into matches
+                                     orderby matches.Key ascending
+                                     select matches.Distinct().Single().Item1)
+                                     .ToArray();
+
+            return genericArguments.Zip(bindingCandidates, (argument, match) => match).Concat(genericArguments.Skip(bindingCandidates.Length)).ToArray();
+        }
+
+        internal static IEnumerable<Tuple<Type, int>> GetParameterBindings(Type parameterType, Type argumentType)
+        {
+            // If parameter is a generic parameter, just bind it to the input type
+            if (parameterType.IsGenericParameter)
+            {
+                return Enumerable.Repeat(Tuple.Create(argumentType, parameterType.GenericParameterPosition), 1);
+            }
+            // If parameter contains generic parameters, we may have possible bindings
+            else if (parameterType.ContainsGenericParameters)
+            {
+                // Check if we have a straight type match
+                var bindings = MatchTypeBindings(parameterType, argumentType).ToArray();
+                if (bindings.Length > 0) return bindings;
+
+                // Direct match didn't produce any bindings, so we need to check inheritance chain
+                Type currentType = argumentType;
+                while (currentType != typeof(object))
+                {
+                    currentType = currentType.BaseType;
+                    if (currentType == null) break;
+                    bindings = MatchTypeBindings(parameterType, currentType).ToArray();
+                    if (bindings.Length > 0) return bindings;
+                }
+
+                // Inheritance chain match didn't produce any bindings, so we need to check interface set
+                var interfaces = argumentType.GetInterfaces();
+                foreach (var interfaceType in interfaces)
+                {
+                    bindings = MatchTypeBindings(parameterType, interfaceType).ToArray();
+                    if (bindings.Length > 0) return bindings;
+                }
+            }
+
+            // If parameter does not contain generic parameters, there's nothing to bind to (check for error?)
+            return Enumerable.Empty<Tuple<Type, int>>();
+        }
+
+        static IEnumerable<Tuple<Type, int>> MatchTypeBindings(Type parameterType, Type argumentType)
+        {
+            // If both types have element types, try to recurse into them
+            if (parameterType.HasElementType && argumentType.HasElementType)
+            {
+                if (parameterType.IsArray && !argumentType.IsArray ||
+                    parameterType.IsPointer && !argumentType.IsPointer ||
+                    parameterType.IsByRef && !argumentType.IsByRef)
+                {
+                    return Enumerable.Empty<Tuple<Type, int>>();
+                }
+
+                var parameterElementType = parameterType.GetElementType();
+                var argumentElementType = argumentType.GetElementType();
+                return GetParameterBindings(parameterElementType, argumentElementType);
+            }
+
+            // Match bindings can only be obtained if both types are generic types
+            if (parameterType.IsGenericType && argumentType.IsGenericType)
+            {
+                var parameterTypeDefinition = parameterType.GetGenericTypeDefinition();
+                var argumentTypeDefinition = argumentType.GetGenericTypeDefinition();
+                // Match bindings can only be obtained if both types share the same type definition
+                if (parameterTypeDefinition == argumentTypeDefinition)
+                {
+                    var parameterGenericArguments = parameterType.GetGenericArguments();
+                    var argumentGenericArguments = argumentType.GetGenericArguments();
+                    return parameterGenericArguments
+                        .Zip(argumentGenericArguments, (parameter, argument) => GetParameterBindings(parameter, argument))
+                        .SelectMany(xs => xs);
+                }
+            }
+
+            return Enumerable.Empty<Tuple<Type, int>>();
+        }
+
+        static bool MatchParamArrayTypeReferences(Type parameter, Type argument)
+        {
+            if (parameter.HasElementType && argument.HasElementType)
+            {
+                return MatchParamArrayTypeReferences(parameter.GetElementType(), argument.GetElementType());
+            }
+
+            return parameter.HasElementType == argument.HasElementType;
+        }
+
+        static bool ParamExpansionRequired(ParameterInfo[] parameters, Type[] arguments)
+        {
+            var offset = parameters.Length - 1;
+            var paramArray = parameters.Length > 0 &&
+                parameters[offset].ParameterType.IsArray &&
+                Attribute.IsDefined(parameters[offset], typeof(ParamArrayAttribute));
+
+            return paramArray &&
+                (parameters.Length != arguments.Length ||
+                 !MatchParamArrayTypeReferences(parameters[offset].ParameterType, arguments[arguments.Length - 1]));
+        }
+
+        static MethodInfo MakeGenericMethod(MethodInfo method, params Type[] argumentTypes)
+        {
+            if (!method.IsGenericMethodDefinition)
+            {
+                throw new ArgumentException("The specified method is not a generic definition.");
+            }
+
+            var methodCallArgumentTypes = (Type[])argumentTypes.Clone();
+            var methodParameters = method.GetParameters();
+            if (ParamExpansionRequired(methodParameters, methodCallArgumentTypes))
+            {
+                var arrayType = methodCallArgumentTypes[methodCallArgumentTypes.Length - 1].MakeArrayType();
+                Array.Resize(ref methodCallArgumentTypes, methodParameters.Length);
+                methodCallArgumentTypes[methodCallArgumentTypes.Length - 1] = arrayType;
+            }
+
+            var typeArguments = GetMethodTypeArguments(method, methodCallArgumentTypes);
+            var genericArguments = method.GetGenericArguments();
+            return genericArguments.Length == typeArguments.Length ? method.MakeGenericMethod(typeArguments) : method;
+        }
+
+        static bool CanExpandParamArguments(ParameterInfo[] parameters, Type[] argumentTypes)
+        {
+            var offset = parameters.Length - 1;
+            var arrayType = parameters[offset].ParameterType.GetElementType();
+            for (int i = offset; i < argumentTypes.Length; i++)
+            {
+                if (argumentTypes[i] != arrayType && !HasObservableConversion(argumentTypes[i], arrayType))
+                {
+                    return false;
+                }
+            }
+
+            return true;
+        }
+
+        static Expression[] ExpandParamArguments(ParameterInfo[] parameters, Expression[] arguments)
+        {
+            var offset = parameters.Length - 1;
+            var arrayType = parameters[offset].ParameterType.GetElementType();
+            var initializers = new Expression[arguments.Length - offset];
+            for (int k = 0; k < initializers.Length; k++)
+            {
+                if (arguments[k + offset].Type != arrayType)
+                {
+                    arguments[k + offset] = CoerceMethodArgument(arguments[k + offset], arrayType);
+                }
+                initializers[k] = arguments[k + offset];
+            }
+            var paramArray = Expression.NewArrayInit(arrayType, initializers);
+            Array.Resize(ref arguments, parameters.Length);
+            arguments[arguments.Length - 1] = paramArray;
+            return arguments;
+        }
+
+        internal static Expression CoerceMethodArgument(Expression argument, Type parameterType)
+        {
+            return Expression.Convert(argument, parameterType);
+        }
+
+        static Expression[] MatchMethodParameters(ParameterInfo[] parameters, Expression[] arguments)
+        {
+            int i = 0;
+            return Array.ConvertAll(arguments, argument =>
+            {
+                var parameterType = parameters[i++].ParameterType;
+                if (argument.Type != parameterType)
+                {
+                    argument = CoerceMethodArgument(argument, parameterType);
+                }
+                return argument;
+            });
+        }
+
+        #endregion
+
+        #region Method Validation
+
+        static bool IsNullable(Type type)
+        {
+            return type.IsGenericType && type.GetGenericTypeDefinition() == typeof(Nullable<>);
+        }
+
+        static Type GetNonNullableType(Type type)
+        {
+            return IsNullable(type) ? type.GetGenericArguments()[0] : type;
+        }
+
+        static bool IsConvertiblePrimitive(Type type)
+        {
+            var nonNullableType = GetNonNullableType(type);
+            if (nonNullableType == typeof(bool)) return false;
+            if (nonNullableType.IsEnum) return true;
+            return nonNullableType.IsPrimitive;
+        }
+
+        static bool HasPrimitiveConversion(Type from, Type to)
+        {
+            if (from == to) return true;
+            if (IsNullable(from) && GetNonNullableType(from) == to) return true;
+            if (IsNullable(to) && GetNonNullableType(to) == from) return true;
+            return IsConvertiblePrimitive(from) && IsConvertiblePrimitive(to);
+        }
+
+        static bool HasReferenceConversion(Type from, Type to)
+        {
+            if (from == to) return true;
+            var nonNullableFrom = GetNonNullableType(from);
+            var nonNullableTo = GetNonNullableType(to);
+            if (nonNullableTo.IsAssignableFrom(nonNullableFrom)) return true;
+            return from == typeof(object) || to == typeof(object);
+        }
+
+        static MethodInfo GetUnaryOperator(Type type, string name, Type parameterType, Type returnType)
+        {
+            var methods = GetNonNullableType(type).GetMethods(PublicStaticBinding);
+            foreach (var method in methods)
+            {
+                if (method.Name != name || method.IsGenericMethod || method.ReturnType != returnType) continue;
+
+                var parameters = method.GetParameters();
+                if (parameters.Length != 1) continue;
+
+                if (parameters[0].ParameterType.IsAssignableFrom(GetNonNullableType(parameterType)))
+                {
+                    return method;
+                }
+            }
+
+            return null;
+        }
+
+        static MethodInfo GetUserConversion(Type from, Type to)
+        {
+            var conversion = GetUnaryOperator(from, "op_Implicit", from, to);
+            conversion = conversion ?? GetUnaryOperator(from, "op_Explicit", from, to);
+            conversion = conversion ?? GetUnaryOperator(to, "op_Implicit", from, to);
+            return conversion ?? GetUnaryOperator(to, "op_Explicit", from, to);
+        }
+
+        static bool HasConversion(Type from, Type to)
+        {
+            return HasPrimitiveConversion(from, to) || HasReferenceConversion(from, to) ||
+                   GetUserConversion(from, to) != null;
+        }
+
+        static bool HasObservableConversion(Type from, Type to)
+        {
+            if (from.IsGenericType && to.IsGenericType &&
+                from.GetGenericTypeDefinition() == typeof(IObservable<>) &&
+                to.GetGenericTypeDefinition() == typeof(IObservable<>))
+            {
+                var argumentObservableType = from.GetGenericArguments()[0];
+                var parameterObservableType = to.GetGenericArguments()[0];
+                return HasConversion(argumentObservableType, parameterObservableType);
+            }
+
+            return HasConversion(from, to);
+        }
+
+        static bool CanMatchMethodParameters(ParameterInfo[] parameters, Expression[] arguments)
+        {
+            int i = 0;
+            if (parameters.Length != arguments.Length) return false;
+            return Array.TrueForAll(arguments, argument =>
+            {
+                var parameterType = parameters[i++].ParameterType;
+                if (argument.Type != parameterType)
+                {
+                    return HasObservableConversion(argument.Type, parameterType);
+                }
+
+                return true;
+            });
+        }
+
+        #endregion
+
+        #region Overload Resolution
+
+        static readonly BindingFlags PublicStaticBinding = BindingFlags.Public | BindingFlags.Static | BindingFlags.FlattenHierarchy;
+        static readonly Dictionary<Type, Type[]> ImplicitNumericConversions = new Dictionary<Type, Type[]>
+        {
+            { typeof(sbyte), new[] { typeof(short), typeof(int), typeof(long), typeof(float), typeof(double), typeof(decimal) } },
+            { typeof(byte), new[] { typeof(short), typeof(ushort), typeof(int), typeof(uint), typeof(long), typeof(ulong), typeof(float), typeof(double), typeof(decimal) } },
+            { typeof(short), new[] { typeof(int), typeof(long), typeof(float), typeof(double), typeof(decimal) } },
+            { typeof(ushort), new[] { typeof(int), typeof(uint), typeof(long), typeof(ulong), typeof(float), typeof(double), typeof(decimal) } },
+            { typeof(int), new[] { typeof(long), typeof(float), typeof(double), typeof(decimal) } },
+            { typeof(uint), new[] { typeof(long), typeof(ulong), typeof(float), typeof(double), typeof(decimal) } },
+            { typeof(long), new[] { typeof(float), typeof(double), typeof(decimal) } },
+            { typeof(char), new[] { typeof(ushort), typeof(int), typeof(uint), typeof(long), typeof(ulong), typeof(float), typeof(double), typeof(decimal) } },
+            { typeof(float), new[] { typeof(double) } },
+            { typeof(ulong), new[] { typeof(float), typeof(double), typeof(decimal) } }
+        };
+
+        static bool HasImplicitConversion(Type from, Type to)
+        {
+            if (to.IsAssignableFrom(from)) return true;
+
+            Type[] conversions;
+            if (ImplicitNumericConversions.TryGetValue(from, out conversions))
+            {
+                return Array.Exists(conversions, type => type == to);
+            }
+
+            return from.GetMethods(BindingFlags.Public | BindingFlags.Static)
+                       .Any(m => m.ReturnType == to && m.Name == "op_Implicit");
+        }
+
+        internal static int CompareConversion(Type t1, Type t2, Type s)
+        {
+            if (t1 == t2) return 0;
+            if (s == t1) return -1;
+            if (s == t2) return 1;
+
+            var implicitT1T2 = HasImplicitConversion(t1, t2);
+            var implicitT2T1 = HasImplicitConversion(t2, t1);
+            if (implicitT1T2 && !implicitT2T1) return -1;
+            if (implicitT2T1 && !implicitT1T2) return 1;
+
+            var t1Code = Type.GetTypeCode(t1);
+            var t2Code = Type.GetTypeCode(t2);
+            if (t1Code == TypeCode.SByte &&
+                (t2Code == TypeCode.Byte || t2Code == TypeCode.UInt16 ||
+                 t2Code == TypeCode.UInt32 || t2Code == TypeCode.UInt64)) return -1;
+
+            if (t2Code == TypeCode.SByte &&
+                (t1Code == TypeCode.Byte || t1Code == TypeCode.UInt16 ||
+                 t1Code == TypeCode.UInt32 || t1Code == TypeCode.UInt64)) return 1;
+
+            if (t1Code == TypeCode.Int16 &&
+                (t2Code == TypeCode.UInt16 || t2Code == TypeCode.UInt32 || t2Code == TypeCode.UInt64)) return -1;
+            if (t2Code == TypeCode.Int16 &&
+                (t1Code == TypeCode.UInt16 || t1Code == TypeCode.UInt32 || t1Code == TypeCode.UInt64)) return 1;
+
+            if (t1Code == TypeCode.Int32 && (t2Code == TypeCode.UInt32 || t2Code == TypeCode.UInt64)) return -1;
+            if (t2Code == TypeCode.Int32 && (t1Code == TypeCode.UInt32 || t1Code == TypeCode.UInt64)) return 1;
+            if (t1Code == TypeCode.Int64 && t2Code == TypeCode.UInt64) return -1;
+            if (t2Code == TypeCode.Int64 && t1Code == TypeCode.UInt64) return 1;
+            return 0;
+        }
+
+        static int CompareFunctionMember(Type[] parametersA, Type[] parametersB, Type[] arguments)
+        {
+            bool? betterA = null;
+            bool? betterB = null;
+            for (int i = 0; i < arguments.Length; i++)
+            {
+                var comparison = CompareConversion(parametersA[i], parametersB[i], arguments[i]);
+                if (comparison < 0)
+                {
+                    if (!betterA.HasValue) betterA = true;
+                    betterB = false;
+                }
+                else if (comparison > 0)
+                {
+                    if (!betterB.HasValue) betterB = true;
+                    betterA = false;
+                }
+            }
+
+            if (betterA.GetValueOrDefault()) return -1;
+            if (betterB.GetValueOrDefault()) return 1;
+            return 0;
+        }
+
+        static bool IsObservable(Type type)
+        {
+            return type.IsGenericType && type.GetGenericTypeDefinition() == typeof(IObservable<>);
+        }
+
+        static Type GetObservableElementType(Type type)
+        {
+            return IsObservable(type) ? type.GetGenericArguments()[0] : type;
+        }
+
+        static Type[] ExpandCallParameterTypes(ParameterInfo[] parameters, Type[] arguments, bool expansion)
+        {
+            var expandedParameters = new Type[arguments.Length];
+            for (int i = 0; i < parameters.Length; i++)
+            {
+                expandedParameters[i] = GetObservableElementType(parameters[i].ParameterType);
+            }
+
+            if (expansion)
+            {
+                for (int i = parameters.Length - 1; i < expandedParameters.Length; i++)
+                {
+                    expandedParameters[i] = GetObservableElementType(parameters[parameters.Length - 1].ParameterType.GetElementType());
+                }
+            }
+
+            return expandedParameters;
+        }
+
+        #endregion
+
+        #region Call Resolution
+
+        internal static Expression BuildCall(Expression instance, IEnumerable<MethodInfo> methods, params Expression[] arguments)
+        {
+            var argumentTypes = Array.ConvertAll(arguments, argument => argument.Type);
+            var candidates = methods
+                .Where(method =>
+                {
+                    var parameters = method.GetParameters();
+                    return parameters.Length == arguments.Length ||
+                        parameters.Length > 0 && arguments.Length >= (parameters.Length - 1) &&
+                        Attribute.IsDefined(parameters[parameters.Length - 1], typeof(ParamArrayAttribute));
+                })
+                .Select(method =>
+                {
+                    MethodCallExpression call;
+                    try
+                    {
+                        if (method.IsGenericMethodDefinition)
+                        {
+                            method = MakeGenericMethod(method, argumentTypes);
+                            if (method.IsGenericMethodDefinition) return null;
+                        }
+
+                        var callArguments = arguments;
+                        var parameters = method.GetParameters();
+                        if (ParamExpansionRequired(parameters, argumentTypes))
+                        {
+                            if (!CanExpandParamArguments(parameters, argumentTypes)) return null;
+                            callArguments = ExpandParamArguments(parameters, callArguments);
+                        }
+
+                        if (!CanMatchMethodParameters(parameters, callArguments)) return null;
+                        callArguments = MatchMethodParameters(parameters, callArguments);
+                        call = Expression.Call(instance, method, callArguments);
+                    }
+                    catch (ArgumentException) { return null; }
+                    catch (InvalidOperationException) { return null; }
+                    return new
+                    {
+                        call,
+                        generic = call.Method != method,
+                        expansion = ParamExpansionRequired(call.Method.GetParameters(), argumentTypes)
+                    };
+                })
+                .Where(candidate => candidate != null)
+                .ToArray();
+
+            if (candidates.Length == 0)
+            {
+                throw new InvalidOperationException("No method overload found for the given arguments.");
+            }
+
+            if (candidates.Length == 1) return candidates[0].call;
+
+            int best = -1;
+            argumentTypes = Array.ConvertAll(argumentTypes, argumentType => GetObservableElementType(argumentType));
+            var candidateParameters = Array.ConvertAll(
+                candidates,
+                candidate => ExpandCallParameterTypes(candidate.call.Method.GetParameters(), argumentTypes, candidate.expansion));
+
+            for (int i = 0; i < candidateParameters.Length; )
+            {
+                for (int j = 0; j < candidateParameters.Length; j++)
+                {
+                    if (i == j) continue;
+                    var comparison = CompareFunctionMember(
+                        candidateParameters[i],
+                        candidateParameters[j],
+                        argumentTypes);
+
+                    int oldBest = -1;
+                    if (best >= 0) oldBest = best;
+                    if (comparison < 0) best = i;
+                    if (comparison > 0) best = j;
+                    if (comparison == 0)
+                    {
+                        var tie = true;
+                        if (!candidates[i].generic && candidates[j].generic) { best = i; tie = false; }
+                        if (!candidates[j].generic && candidates[i].generic) { best = j; tie = false; }
+
+                        if (tie)
+                        {
+                            if (!candidates[i].expansion && candidates[j].expansion) best = i;
+                            if (!candidates[j].expansion && candidates[i].expansion) best = j;
+                        }
+                    }
+
+                    if (best != oldBest && oldBest > 0)
+                    {
+                        best = -1;
+                        break;
+                    }
+
+                    if (best == j) break;
+                }
+
+                if (best < 0) break;
+                if (best == i) break;
+                i = best;
+            }
+
+            if (best < 0) throw new InvalidOperationException("The method overload call is ambiguous.");
+            return candidates[best].call;
+        }
+
+        #endregion
+
         private static Dictionary<Type, List<Type>> NumConv = new Dictionary<Type, List<Type>> {
             {typeof(sbyte), new List<Type> { typeof(short), typeof(int), typeof(long), typeof(float), typeof(double), typeof(decimal) }},
             {typeof(byte), new List<Type> { typeof(short) ,typeof(ushort), typeof(int), typeof(uint), typeof(long), typeof(ulong), typeof(float), typeof(double) ,typeof(decimal)}},
